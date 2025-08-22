@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Reels/TikTok Ideas Bot — polling version
+Reels/TikTok Ideas Bot — Polling Version with Premium/Monetization
 """
 
 import asyncio
@@ -48,6 +48,7 @@ ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
+# --- DATABASE ---
 DB_PATH = "./data.db"
 os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS favorites(
 )""")
 conn.commit()
 
+# --- HELPERS ---
 MDV2_SPECIALS = r"_*[]()~`>#+-=|{}.!"
 def md2_escape(text: str) -> str:
     return re.sub(f"([{re.escape(MDV2_SPECIALS)}])", r"\\\1", text)
@@ -98,6 +100,7 @@ def chunk(text: str, size: int = 3500) -> List[str]:
 def today() -> dt.date:
     return dt.datetime.utcnow().date()
 
+# --- USER MANAGEMENT ---
 def ensure_user(u: "telegram.User"):
     now = today()
     with conn:
@@ -138,7 +141,7 @@ def set_premium(user_id: int, until: dt.date):
     with conn:
         conn.execute("UPDATE users SET premium_until=? WHERE user_id=?", (until, user_id,))
 
-# Локальные генераторы
+# --- LOCAL GENERATORS ---
 LOCAL_TEMPLATES = [
     ("Before/After", "Покажи до/после в нише {niche}: 3 шага, 30 секунд, конкретика."),
     ("1 Ошибка — 1 Фикс", "Главная ошибка в {niche} и простое исправление с наглядным примером."),
@@ -183,6 +186,7 @@ async def generate_ideas(niche: str, k: int = 3) -> str:
     return ideas
 
 DAY_THEMES = ["Боль подписчика", "Лайфхак", "Миф vs Факт", "История", "Инструмент", "ТОП-3 ошибки", "Коллаб"]
+
 def plan_item(niche: str, day: int, theme: str) -> str:
     title, synopsis = LOCAL_TEMPLATES[day % len(LOCAL_TEMPLATES)]
     return textwrap.dedent(f"*День {day+1}: {md2_escape(theme)}*\n🎬 {md2_escape(title)}\n✍️ {md2_escape(synopsis.format(niche=niche))}\n🎶 {md2_escape(TREND_SOUNDS[day % len(TREND_SOUNDS)])}")
@@ -193,6 +197,7 @@ async def build_7day_plan(niche: str) -> str:
         blocks.append(plan_item(niche, i, theme))
     return "\n\n".join(blocks)
 
+# --- KEYBOARDS ---
 def keyboard_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎯 Ещё идеи", callback_data="more"),
@@ -202,6 +207,7 @@ def keyboard_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💾 Избранное", callback_data="saved")],
     ])
 
+# --- TEXTS ---
 WELCOME = "👋 Привет! Напиши нишу, например: _фитнес_, и я пришлю идеи.\nКоманды: /ideas, /plan, /trends, /saved, /premium, /stats, /help"
 HELP = "🆘 Помощь: напиши нишу, /plan <ниша>, /trends, /saved, /premium, /stats"
 
@@ -209,6 +215,7 @@ async def send_long_markdown(chat, text: str):
     for p in chunk(text):
         await chat.send_message(p, parse_mode=ParseMode.MARKDOWN_V2)
 
+# --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user)
     await update.message.reply_markdown_v2(md2_escape(WELCOME), reply_markup=keyboard_main())
@@ -235,6 +242,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_premium:
         inc_quota(user_id)
 
+# --- BUILD APP ---
 def build_app() -> Application:
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -242,8 +250,8 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     return app
 
+# --- MAIN ---
 if __name__ == "__main__":
-    try:
-        asyncio.run(build_app().run_polling())
-    except KeyboardInterrupt:
-        log.info("Bot stopped by user")
+    log.info("Starting bot...")
+    app = build_app()
+    app.run_polling()
