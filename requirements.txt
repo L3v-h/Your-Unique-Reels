@@ -2,4 +2,5 @@ python-telegram-bot>=22.3
 openai==1.40.6
 aiohttp==3.9.5
 python-dotenv==1.0.1
+yookassa==3.0.0
 
