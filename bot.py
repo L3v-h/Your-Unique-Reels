@@ -130,6 +130,23 @@ def init_db() -> None:
         )
         """
     )
+    # Новая таблица для сценариев: фиксируем факт генерации и одноразовые бонусы (хук/обложка)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scripts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            theme TEXT,
+            niche TEXT,
+            tone TEXT,
+            content TEXT,
+            hooks_generated INTEGER DEFAULT 0,
+            cover_generated INTEGER DEFAULT 0,
+            created_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -180,44 +197,62 @@ def inc_total_generated(user_id: int) -> None:
     conn.close()
 
 
-def create_payment(
-    user_id: int, package_code: str, yk_id: str, amount: int, status: str
-) -> int:
+# ---------- SCRIPTS TABLE HELPERS (NEW) ----------
+
+def create_script_record(user_id: int, theme: str, niche: Optional[str], tone: Optional[str], content: str) -> int:
     conn = db()
     cur = conn.cursor()
-    created = datetime.now(timezone.utc).isoformat()
-    package_count = PACKAGES[package_code]["count"]
     cur.execute(
         """
-        INSERT INTO payments (user_id, package_code, package_count, amount, status, yk_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO scripts (user_id, theme, niche, tone, content, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (user_id, package_code, package_count, amount, status, yk_id, created, created),
+        (user_id, theme, niche, tone, content, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
-    payment_id = cur.lastrowid
+    sid = cur.lastrowid
     conn.close()
-    return payment_id
+    return sid
 
 
-def update_payment_status(yk_id: str, new_status: str) -> Optional[sqlite3.Row]:
+def get_last_script(user_id: int) -> Optional[sqlite3.Row]:
     conn = db()
     cur = conn.cursor()
-    cur.execute("UPDATE payments SET status=?, updated_at=? WHERE yk_id=?", (new_status, datetime.now(timezone.utc).isoformat(), yk_id))
+    cur.execute(
+        "SELECT * FROM scripts WHERE user_id=? ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_script_by_id(script_id: int, user_id: int) -> Optional[sqlite3.Row]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM scripts WHERE id=? AND user_id=?",
+        (script_id, user_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def mark_hook_generated(script_id: int) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("UPDATE scripts SET hooks_generated=1 WHERE id=?", (script_id,))
     conn.commit()
-    cur.execute("SELECT * FROM payments WHERE yk_id=?", (yk_id,))
-    row = cur.fetchone()
     conn.close()
-    return row
 
 
-def get_payment_by_yk_id(yk_id: str) -> Optional[sqlite3.Row]:
+def mark_cover_generated(script_id: int) -> None:
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM payments WHERE yk_id=?", (yk_id,))
-    row = cur.fetchone()
+    cur.execute("UPDATE scripts SET cover_generated=1 WHERE id=?", (script_id,))
+    conn.commit()
     conn.close()
-    return row
 
 
 # -------------------- UI HELPERS --------------------
@@ -235,9 +270,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("ℹ️ О боте", callback_data="about"),
         ],
     ]
-    # дополнительные фишки
+    # дополнительные фишки (работают теперь только для последнего сценария пользователя)
     extra = [InlineKeyboardButton(title, callback_data=cd) for title, cd in EXTRA_TOOLS]
-    # по две кнопки в ряд
     for i in range(0, len(extra), 2):
         rows.append(extra[i : i + 2])
     return InlineKeyboardMarkup(rows)
@@ -270,6 +304,17 @@ def back_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="back_main")]])
 
 
+# Клавиатура для конкретного сгенерированного сценария (NEW)
+def script_tools_kb(script_row: sqlite3.Row) -> InlineKeyboardMarkup:
+    rows = []
+    if not script_row["hooks_generated"]:
+        rows.append([InlineKeyboardButton("⚡ Получить хук для этого сценария", callback_data=f"script_hook::{script_row['id']}")])
+    if not script_row["cover_generated"]:
+        rows.append([InlineKeyboardButton("🪄 Обложка к этому сценарию", callback_data=f"script_cover::{script_row['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
 # -------------------- TEXT TEMPLATES --------------------
 
 WELCOME = (
@@ -282,10 +327,14 @@ WELCOME = (
 
 ABOUT = (
     "🤖 *ReelsIdeas Pro*\n"
-    "— Полные сценарии с точными таймкодами, хуками и листом шотов\n"
-    "— Подпись, хештеги, CTA и вариации под ниши\n"
-    "— Анализ трендов и форматов (в т.ч. ремиксы/рефреймы)\n\n"
-    "Оплата через ЮKassa. После покупки сценарии попадут на ваш баланс.\n"
+    "— Полные сценарии с таймкодами, хуками и листом шотов\n"
+    "— Подпись, хештеги, CTA и идеи ремиксов/рефреймов\n"
+    "— Анализ трендов и форматов (UGC/стоки, jump-cut, ремиксы)\n\n"
+    "🎁 Для *каждого* сгенерированного сценария вы получаете *бесплатно*:\n"
+    "   • 1 хук (цепляющее начало) — один раз на сценарий\n"
+    "   • 1 идею обложки — один раз на сценарий\n"
+    "   (их можно запросить сразу после генерации сценария)\n\n"
+    "💳 Оплата через ЮKassa. После покупки сценарии начисляются на баланс.\n"
 )
 
 FREE_COOLDOWN_HOURS = 24 * 7  # 1 бесплатный раз в 7 дней
@@ -335,6 +384,7 @@ async def generate_script(theme: str, niche: Optional[str], tone: Optional[str])
     return content
 
 
+# СТАРЫЕ функции оставляем для совместимости (не используются в новой логике)
 async def generate_hooks(niche: Optional[str]) -> str:
     niche = niche or "универсальная ниша"
     resp = client.chat.completions.create(
@@ -359,6 +409,33 @@ async def generate_covers(niche: Optional[str]) -> str:
         ],
         temperature=0.8,
         max_tokens=400,
+    )
+    return resp.choices[0].message.content
+
+
+# НОВЫЕ функции — на основе готового сценария
+async def generate_hooks_for_script(script_text: str) -> str:
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "Генерируешь мощные, краткие хуки (3–7 слов) строго из логики сценария."},
+            {"role": "user", "content": f"Вот сценарий ролика:\n\n{script_text}\n\nСгенерируй 12 ультрацепких хуков (каждый с новой строки)."},
+        ],
+        temperature=0.9,
+        max_tokens=500,
+    )
+    return resp.choices[0].message.content
+
+
+async def generate_cover_for_script(script_text: str) -> str:
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "Придумываешь сильные обложки/титры под Reels, строго опираясь на сценарий."},
+            {"role": "user", "content": f"Вот сценарий ролика:\n\n{script_text}\n\nДай 10 коротких вариантов обложки (1–4 слова) + 3 строки ниже: визуальная идея/цвет и объект крупным планом."},
+        ],
+        temperature=0.8,
+        max_tokens=500,
     )
     return resp.choices[0].message.content
 
@@ -564,14 +641,99 @@ async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["gen_state"] = "await_niche_tone"
         return
 
+    # --- ДОП ИНСТРУМЕНТЫ ТЕПЕРЬ РАБОТАЮТ ТОЛЬКО ДЛЯ ПОСЛЕДНЕГО СЦЕНАРИЯ ---
     if data in ("tool_hooks", "tool_covers"):
-        # спросим нишу
-        key = "hooks" if data == "tool_hooks" else "covers"
-        context.user_data["tool_mode"] = key
-        await q.edit_message_text(
-            "Введи нишу (например: «саморазвитие для студентов»). Если пропустить — отправь «-».",
-            reply_markup=back_main_kb(),
-        )
+        last = get_last_script(user.id)
+        if not last:
+            await q.edit_message_text(
+                "Сначала сгенерируйте сценарий. После этого вы сможете бесплатно получить 1 хук и 1 обложку для него.",
+                reply_markup=back_main_kb(),
+            )
+            return
+
+        if data == "tool_hooks":
+            if last["hooks_generated"]:
+                await q.edit_message_text(
+                    "Хук для последнего сценария уже сгенерирован ✅",
+                    reply_markup=script_tools_kb(last),
+                )
+                return
+            await q.edit_message_text("Генерирую хук для последнего сценария…")
+            try:
+                hooks = await generate_hooks_for_script(last["content"])
+                mark_hook_generated(last["id"])
+                for chunk in split_message(hooks, 3900):
+                    await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(last["id"], user.id)))
+            except Exception as e:
+                await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(last))
+            return
+
+        if data == "tool_covers":
+            if last["cover_generated"]:
+                await q.edit_message_text(
+                    "Обложка для последнего сценария уже сгенерирована ✅",
+                    reply_markup=script_tools_kb(last),
+                )
+                return
+            await q.edit_message_text("Генерирую идею обложки для последнего сценария…")
+            try:
+                covers = await generate_cover_for_script(last["content"])
+                mark_cover_generated(last["id"])
+                for chunk in split_message(covers, 3900):
+                    await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(last["id"], user.id)))
+            except Exception as e:
+                await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(last))
+            return
+
+    # Кнопки, привязанные конкретно к ID сценария
+    if data.startswith("script_hook::"):
+        try:
+            sid = int(data.split("::", 1)[1])
+        except Exception:
+            await q.edit_message_text("Некорректный сценарий.", reply_markup=back_main_kb())
+            return
+        row = get_script_by_id(sid, user.id)
+        if not row:
+            await q.edit_message_text("Сценарий не найден.", reply_markup=back_main_kb())
+            return
+        if row["hooks_generated"]:
+            await q.edit_message_text("Хук уже сгенерирован ✅", reply_markup=script_tools_kb(row))
+            return
+        await q.edit_message_text("Генерирую хук…")
+        try:
+            hooks = await generate_hooks_for_script(row["content"])
+            mark_hook_generated(sid)
+            for chunk in split_message(hooks, 3900):
+                await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(sid, user.id)))
+        except Exception as e:
+            await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(row))
+        return
+
+    if data.startswith("script_cover::"):
+        try:
+            sid = int(data.split("::", 1)[1])
+        except Exception:
+            await q.edit_message_text("Некорректный сценарий.", reply_markup=back_main_kb())
+            return
+        row = get_script_by_id(sid, user.id)
+        if not row:
+            await q.edit_message_text("Сценарий не найден.", reply_markup=back_main_kb())
+            return
+        if row["cover_generated"]:
+            await q.edit_message_text("Обложка уже сгенерирована ✅", reply_markup=script_tools_kb(row))
+            return
+        await q.edit_message_text("Генерирую обложку…")
+        try:
+            covers = await generate_cover_for_script(row["content"])
+            mark_cover_generated(sid)
+            for chunk in split_message(covers, 3900):
+                await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(sid, user.id)))
+        except Exception as e:
+            await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(row))
         return
 
     if data.startswith("buy::"):
@@ -659,27 +821,13 @@ async def on_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # Инструменты
-    if tool_mode == "hooks":
-        niche = None if text == "-" else text
-        await update.message.reply_text("Генерирую хук-фразы…")
-        try:
-            hooks = await generate_hooks(niche)
-            await update.message.reply_text(hooks, reply_markup=back_main_kb())
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=back_main_kb())
+    # Старые инструменты через ввод ниши — теперь отключаем и ведём пользователя корректно
+    if tool_mode in ("hooks", "covers"):
         context.user_data.clear()
-        return
-
-    if tool_mode == "covers":
-        niche = None if text == "-" else text
-        await update.message.reply_text("Генерирую идеи обложек…")
-        try:
-            covers = await generate_covers(niche)
-            await update.message.reply_text(covers, reply_markup=back_main_kb())
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=back_main_kb())
-        context.user_data.clear()
+        await update.message.reply_text(
+            "Сначала сгенерируйте сценарий. После этого кнопки «⚡ Хуки…» и «🪄 Обложки…» станут активны бесплатно для этого сценария.",
+            reply_markup=main_menu_kb(),
+        )
         return
 
     # Иначе просто покажем меню
@@ -733,11 +881,20 @@ async def process_generation(
 
     try:
         script = await generate_script(theme, niche, tone)
+        # Сохраним сценарий в БД и предложим хук/обложку
+        script_id = create_script_record(user_id, theme, niche, tone, script)
         inc_total_generated(user_id)
-        # аккуратная отправка (разбивка если >4096)
+
+        # отправка сценария (с разбивкой)
         for chunk in split_message(script, 3900):
             await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-        await update.message.reply_text("Готово ✅", reply_markup=main_menu_kb())
+
+        last = get_script_by_id(script_id, user_id)
+        await update.message.reply_text(
+            "Готово ✅\n\nБесплатно для этого сценария доступны:\n• ⚡ 1 хук\n• 🪄 1 обложка\nВыберите ниже:",
+            reply_markup=script_tools_kb(last),
+            parse_mode=ParseMode.MARKDOWN,
+        )
     except Exception as e:
         # если списали баланс и упали — вернём 1 сценарий
         if paid_by.startswith("баланс"):
