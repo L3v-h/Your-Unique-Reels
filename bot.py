@@ -41,8 +41,18 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # твой публичный базовый URL сервиса
-PORT = int(os.getenv("PORT", "8080"))  # порт для aiohttp вебхуков ЮKassa
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+PORT = int(os.getenv("PORT", "8080"))
+
+# Реферальная программа
+REF_BONUS = int(os.getenv("REF_BONUS", "2"))  # сколько сценариев получает реферер за оплату приглашенного
+REF_PROGRAM_TEXT = (
+    "👥 *Реферальная программа*\n\n"
+    "— Отправьте друзьям вашу ссылку ниже.\n"
+    "— Когда приглашённый оплатит любой пакет, вы получите *+{bonus}* сценария(ев).\n\n"
+    "Ваша ссылка:\n`{link}`\n\n"
+    "Количество начислений не ограничено."
+)
 
 # Пакеты сценариев и цены, руб
 PACKAGES: Dict[str, Dict] = {
@@ -74,9 +84,8 @@ EXTRA_TOOLS = [
 # База данных
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 
-# Модель OpenAI (можешь заменить, если есть доступ к другой)
+# Модель OpenAI
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 
 # -------------------- LOGGING --------------------
 
@@ -90,6 +99,9 @@ logging.basicConfig(
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Кэш юзернейма бота для реф-ссылок
+BOT_USERNAME: str = ""
+
 
 # -------------------- DATABASE LAYER --------------------
 
@@ -99,21 +111,31 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def safe_alter_table(cur: sqlite3.Cursor, sql: str) -> None:
+    try:
+        cur.execute(sql)
+    except Exception:
+        # колонки/индексы уже есть — игнорируем
+        pass
+
+
 def init_db() -> None:
     conn = db()
     cur = conn.cursor()
+    # users
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            balance INTEGER DEFAULT 0, -- доступные сценарии
-            last_free_at TEXT,         -- ISO datetime UTC последнего бесплатного
+            balance INTEGER DEFAULT 0,
+            last_free_at TEXT,
             total_generated INTEGER DEFAULT 0,
             created_at TEXT
         )
         """
     )
+    # payments
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS payments (
@@ -122,15 +144,15 @@ def init_db() -> None:
             package_code TEXT,
             package_count INTEGER,
             amount INTEGER,
-            status TEXT,               -- 'pending' | 'succeeded' | 'canceled'
-            yk_id TEXT,                -- id платежа в ЮKassa
+            status TEXT,
+            yk_id TEXT,
             created_at TEXT,
             updated_at TEXT,
             FOREIGN KEY(user_id) REFERENCES users(user_id)
         )
         """
     )
-    # Новая таблица для сценариев: фиксируем факт генерации и одноразовые бонусы (хук/обложка)
+    # scripts
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS scripts (
@@ -147,6 +169,26 @@ def init_db() -> None:
         )
         """
     )
+    # Реферальные расширения users
+    safe_alter_table(cur, "ALTER TABLE users ADD COLUMN ref_code TEXT UNIQUE;")
+    safe_alter_table(cur, "ALTER TABLE users ADD COLUMN referred_by INTEGER;")
+    # Таблица фиксации начислений по рефералкам
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            referee_id INTEGER NOT NULL,
+            payment_id INTEGER NOT NULL,
+            bonus_amount INTEGER NOT NULL,
+            created_at TEXT,
+            UNIQUE(payment_id),
+            FOREIGN KEY(referrer_id) REFERENCES users(user_id),
+            FOREIGN KEY(referee_id) REFERENCES users(user_id),
+            FOREIGN KEY(payment_id) REFERENCES payments(id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -159,15 +201,64 @@ def get_or_create_user(user_id: int, username: Optional[str]) -> sqlite3.Row:
     if row is None:
         now = datetime.now(timezone.utc).isoformat()
         cur.execute(
-            "INSERT INTO users (user_id, username, balance, last_free_at, total_generated, created_at) "
-            "VALUES (?, ?, 0, NULL, 0, ?)",
+            "INSERT INTO users (user_id, username, balance, last_free_at, total_generated, created_at, ref_code, referred_by) "
+            "VALUES (?, ?, 0, NULL, 0, ?, NULL, NULL)",
             (user_id, username, now),
         )
         conn.commit()
+        # сгенерим реф-код
+        ref_code = generate_unique_ref_code(cur)
+        cur.execute("UPDATE users SET ref_code=? WHERE user_id=?", (ref_code, user_id))
+        conn.commit()
         cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
+    else:
+        # если старый пользователь без ref_code — добавим
+        if not row["ref_code"]:
+            ref_code = generate_unique_ref_code(cur)
+            cur.execute("UPDATE users SET ref_code=? WHERE user_id=?", (ref_code, user_id))
+            conn.commit()
+            cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+            row = cur.fetchone()
+        # обновим username при необходимости
+        if username and username != row["username"]:
+            cur.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+            conn.commit()
+            cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+            row = cur.fetchone()
     conn.close()
     return row
+
+
+def generate_unique_ref_code(cur: sqlite3.Cursor) -> str:
+    # короткий человекочитаемый код
+    while True:
+        code = "ref" + os.urandom(4).hex()
+        cur.execute("SELECT 1 FROM users WHERE ref_code=?", (code,))
+        if cur.fetchone() is None:
+            return code
+
+
+def get_user_by_ref_code(ref_code: str) -> Optional[sqlite3.Row]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE ref_code=?", (ref_code,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def set_referred_by_if_empty(user_id: int, referrer_id: int) -> None:
+    if user_id == referrer_id:
+        return
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if row and row["referred_by"] is None:
+        cur.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer_id, user_id))
+        conn.commit()
+    conn.close()
 
 
 def update_user_balance(user_id: int, delta: int) -> None:
@@ -197,7 +288,7 @@ def inc_total_generated(user_id: int) -> None:
     conn.close()
 
 
-# ---------- SCRIPTS TABLE HELPERS (NEW) ----------
+# ---------- SCRIPTS TABLE HELPERS ----------
 
 def create_script_record(user_id: int, theme: str, niche: Optional[str], tone: Optional[str], content: str) -> int:
     conn = db()
@@ -255,6 +346,101 @@ def mark_cover_generated(script_id: int) -> None:
     conn.close()
 
 
+# ---------- PAYMENTS TABLE HELPERS (NEW) ----------
+
+def create_payment(
+    user_id: int,
+    package_code: str,
+    yk_id: str,
+    amount: int,
+    status: str = "pending",
+) -> int:
+    """
+    Создаёт локальную запись платежа. Возвращает payment_id.
+    """
+    package_count = PACKAGES.get(package_code, {}).get("count", 0)
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO payments (user_id, package_code, package_count, amount, status, yk_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, package_code, package_count, amount, status, yk_id, now, now),
+    )
+    conn.commit()
+    pid = cur.lastrowid
+    conn.close()
+    return pid
+
+
+def update_payment_status(yk_id: str, new_status: str) -> Optional[sqlite3.Row]:
+    """
+    Обновляет статус платежа и возвращает полную строку платежа.
+    """
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM payments WHERE yk_id=?", (yk_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+    cur.execute(
+        "UPDATE payments SET status=?, updated_at=? WHERE id=?",
+        (new_status, datetime.now(timezone.utc).isoformat(), row["id"]),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM payments WHERE id=?", (row["id"],))
+    row2 = cur.fetchone()
+    conn.close()
+    return row2
+
+
+def mark_referral_bonus_if_any(payment_row: sqlite3.Row) -> None:
+    """
+    Если платёж успешен — начисляем бонус рефереру один раз.
+    """
+    if not payment_row:
+        return
+    if payment_row["status"] != "succeeded":
+        return
+
+    user_id = payment_row["user_id"]
+    payment_id = payment_row["id"]
+
+    conn = db()
+    cur = conn.cursor()
+    # кто пригласил платившего?
+    cur.execute("SELECT referred_by FROM users WHERE user_id=?", (user_id,))
+    u = cur.fetchone()
+    if not u or u["referred_by"] is None:
+        conn.close()
+        return
+
+    referrer_id = int(u["referred_by"])
+    bonus = max(0, REF_BONUS)
+    if bonus == 0:
+        conn.close()
+        return
+
+    # проверим, не начисляли ли ранее за этот платёж
+    cur.execute("SELECT 1 FROM referrals WHERE payment_id=?", (payment_id,))
+    if cur.fetchone():
+        conn.close()
+        return
+
+    # начисляем рефереру
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (bonus, referrer_id))
+    cur.execute(
+        "INSERT INTO referrals (referrer_id, referee_id, payment_id, bonus_amount, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (referrer_id, user_id, payment_id, bonus, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
 # -------------------- UI HELPERS --------------------
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -267,13 +453,16 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🧮 Баланс", callback_data="balance"),
         ],
         [
+            InlineKeyboardButton("👥 Реферальная программа", callback_data="ref_program"),
+        ],
+        [
             InlineKeyboardButton("ℹ️ О боте", callback_data="about"),
         ],
     ]
-    # дополнительные фишки (работают теперь только для последнего сценария пользователя)
+    # доп фишки
     extra = [InlineKeyboardButton(title, callback_data=cd) for title, cd in EXTRA_TOOLS]
     for i in range(0, len(extra), 2):
-        rows.append(extra[i : i + 2])
+        rows.append(extra[i: i + 2])
     return InlineKeyboardMarkup(rows)
 
 
@@ -304,7 +493,7 @@ def back_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="back_main")]])
 
 
-# Клавиатура для конкретного сгенерированного сценария (NEW)
+# Клавиатура для конкретного сгенерированного сценария
 def script_tools_kb(script_row: sqlite3.Row) -> InlineKeyboardMarkup:
     rows = []
     if not script_row["hooks_generated"]:
@@ -384,7 +573,7 @@ async def generate_script(theme: str, niche: Optional[str], tone: Optional[str])
     return content
 
 
-# СТАРЫЕ функции оставляем для совместимости (не используются в новой логике)
+# Старые функции (совместимость)
 async def generate_hooks(niche: Optional[str]) -> str:
     niche = niche or "универсальная ниша"
     resp = client.chat.completions.create(
@@ -413,7 +602,7 @@ async def generate_covers(niche: Optional[str]) -> str:
     return resp.choices[0].message.content
 
 
-# НОВЫЕ функции — на основе готового сценария
+# Новые функции — на основе готового сценария
 async def generate_hooks_for_script(script_text: str) -> str:
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -446,13 +635,10 @@ YK_BASE = "https://api.yookassa.ru/v3"
 
 
 def yk_auth() -> Tuple[str, str]:
-    # basic auth (shopId:secretKey)
     return (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
 
 
-async def yk_create_payment(
-    user_id: int, package_code: str
-) -> Tuple[str, str]:
+async def yk_create_payment(user_id: int, package_code: str) -> Tuple[str, str]:
     """
     Создаёт платеж и возвращает (yk_id, confirmation_url)
     """
@@ -466,10 +652,8 @@ async def yk_create_payment(
         "description": f"Пакет: {title} для user {user_id}",
         "confirmation": {
             "type": "redirect",
-            # Пользователь вернётся сюда после оплаты (не критично, вебхук всё равно отметит)
             "return_url": f"{WEBHOOK_URL}/thankyou",
         },
-        # Чтобы в вебхуке идентифицировать что это наш заказ
         "metadata": {
             "tg_user_id": user_id,
             "package_code": package_code,
@@ -516,462 +700,4 @@ async def yk_get_payment(yk_id: str) -> dict:
     return r.json()
 
 
-# -------------------- AIOHTTP WEBHOOK (YooKassa) --------------------
-
-async def yk_webhook_handler(request: web.Request) -> web.Response:
-    try:
-        body = await request.text()
-        data = json.loads(body)
-    except Exception:
-        return web.Response(status=400, text="Bad JSON")
-
-    event = data.get("event")
-    obj = data.get("object", {})
-    yk_id = obj.get("id")
-
-    logger.info("Webhook event: %s %s", event, yk_id)
-
-    if not yk_id:
-        return web.Response(status=400, text="No payment id")
-
-    if event == "payment.succeeded":
-        # отметить в БД, начислить сценарии
-        row = update_payment_status(yk_id, "succeeded")
-        if row:
-            update_user_balance(row["user_id"], row["package_count"])
-            logger.info("Payment %s succeeded -> +%s to user %s",
-                        yk_id, row["package_count"], row["user_id"])
-    elif event in ("payment.canceled", "payment.waiting_for_capture", "refund.succeeded"):
-        update_payment_status(yk_id, "canceled")
-
-    return web.Response(text="ok")
-
-
-async def run_web_server() -> web.AppRunner:
-    """
-    Лёгкий aiohttp сервер для вебхука ЮKassa.
-    Не мешает polling Телеграма.
-    """
-    app = web.Application()
-    app.router.add_post("/yookassa/webhook", yk_webhook_handler)
-    app.router.add_get("/thankyou", lambda r: web.Response(text="Спасибо! Возвращайтесь в Telegram."))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info("YooKassa webhook server started on port %s", PORT)
-    return runner
-
-
-# -------------------- BOT HANDLERS --------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    get_or_create_user(user.id, user.username)
-    await update.effective_message.reply_text(WELCOME, reply_markup=main_menu_kb(), parse_mode=ParseMode.MARKDOWN)
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Любой текст отправляем в меню
-    await update.effective_message.reply_text("Выбери действие:", reply_markup=main_menu_kb())
-
-
-async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    data = q.data
-    user = q.from_user
-    get_or_create_user(user.id, user.username)
-
-    if data == "gen":
-        await q.edit_message_text(
-            "Выбери тему для сценария 👇\n(или напиши свою тему одним сообщением)",
-            reply_markup=themes_kb(),
-        )
-        context.user_data["gen_state"] = "choose_theme"
-        return
-
-    if data == "buy":
-        await q.edit_message_text(
-            "Выберите пакет сценариев:",
-            reply_markup=buy_kb(),
-        )
-        return
-
-    if data == "balance":
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT balance, last_free_at, total_generated FROM users WHERE user_id=?", (user.id,))
-        row = cur.fetchone()
-        conn.close()
-        last_free_text = "ещё не использован"
-        if row["last_free_at"]:
-            dt = datetime.fromisoformat(row["last_free_at"])
-            delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
-            remain = max(0, FREE_COOLDOWN_HOURS - int(delta.total_seconds() // 3600))
-            last_free_text = f"доступен через ~{remain} ч" if remain > 0 else "доступен сейчас"
-        text = (
-            f"🧮 *Ваш баланс*: **{row['balance']}** сценариев\n"
-            f"🎁 Бесплатный сценарий: {last_free_text}\n"
-            f"📈 Всего сгенерировано: {row['total_generated']}"
-        )
-        await q.edit_message_text(text, reply_markup=back_main_kb(), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "about":
-        await q.edit_message_text(ABOUT, reply_markup=back_main_kb(), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "back_main":
-        await q.edit_message_text("Главное меню:", reply_markup=main_menu_kb())
-        context.user_data.clear()
-        return
-
-    if data.startswith("theme::"):
-        # Пользователь выбрал одну из заложенных тем
-        theme = data.split("::", 1)[1]
-        context.user_data["chosen_theme"] = theme
-        await q.edit_message_text(
-            f"Тема: *{theme}*\n\nНапиши нишу/аккаунт (например: «фитнес для подростков») и желаемый тон (например: «ироничный»). "
-            f"Формат: `ниша; тон`\n\nЕсли не нужно — отправь «-».",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=back_main_kb(),
-        )
-        context.user_data["gen_state"] = "await_niche_tone"
-        return
-
-    # --- ДОП ИНСТРУМЕНТЫ ТЕПЕРЬ РАБОТАЮТ ТОЛЬКО ДЛЯ ПОСЛЕДНЕГО СЦЕНАРИЯ ---
-    if data in ("tool_hooks", "tool_covers"):
-        last = get_last_script(user.id)
-        if not last:
-            await q.edit_message_text(
-                "Сначала сгенерируйте сценарий. После этого вы сможете бесплатно получить 1 хук и 1 обложку для него.",
-                reply_markup=back_main_kb(),
-            )
-            return
-
-        if data == "tool_hooks":
-            if last["hooks_generated"]:
-                await q.edit_message_text(
-                    "Хук для последнего сценария уже сгенерирован ✅",
-                    reply_markup=script_tools_kb(last),
-                )
-                return
-            await q.edit_message_text("Генерирую хук для последнего сценария…")
-            try:
-                hooks = await generate_hooks_for_script(last["content"])
-                mark_hook_generated(last["id"])
-                for chunk in split_message(hooks, 3900):
-                    await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-                await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(last["id"], user.id)))
-            except Exception as e:
-                await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(last))
-            return
-
-        if data == "tool_covers":
-            if last["cover_generated"]:
-                await q.edit_message_text(
-                    "Обложка для последнего сценария уже сгенерирована ✅",
-                    reply_markup=script_tools_kb(last),
-                )
-                return
-            await q.edit_message_text("Генерирую идею обложки для последнего сценария…")
-            try:
-                covers = await generate_cover_for_script(last["content"])
-                mark_cover_generated(last["id"])
-                for chunk in split_message(covers, 3900):
-                    await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-                await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(last["id"], user.id)))
-            except Exception as e:
-                await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(last))
-            return
-
-    # Кнопки, привязанные конкретно к ID сценария
-    if data.startswith("script_hook::"):
-        try:
-            sid = int(data.split("::", 1)[1])
-        except Exception:
-            await q.edit_message_text("Некорректный сценарий.", reply_markup=back_main_kb())
-            return
-        row = get_script_by_id(sid, user.id)
-        if not row:
-            await q.edit_message_text("Сценарий не найден.", reply_markup=back_main_kb())
-            return
-        if row["hooks_generated"]:
-            await q.edit_message_text("Хук уже сгенерирован ✅", reply_markup=script_tools_kb(row))
-            return
-        await q.edit_message_text("Генерирую хук…")
-        try:
-            hooks = await generate_hooks_for_script(row["content"])
-            mark_hook_generated(sid)
-            for chunk in split_message(hooks, 3900):
-                await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-            await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(sid, user.id)))
-        except Exception as e:
-            await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(row))
-        return
-
-    if data.startswith("script_cover::"):
-        try:
-            sid = int(data.split("::", 1)[1])
-        except Exception:
-            await q.edit_message_text("Некорректный сценарий.", reply_markup=back_main_kb())
-            return
-        row = get_script_by_id(sid, user.id)
-        if not row:
-            await q.edit_message_text("Сценарий не найден.", reply_markup=back_main_kb())
-            return
-        if row["cover_generated"]:
-            await q.edit_message_text("Обложка уже сгенерирована ✅", reply_markup=script_tools_kb(row))
-            return
-        await q.edit_message_text("Генерирую обложку…")
-        try:
-            covers = await generate_cover_for_script(row["content"])
-            mark_cover_generated(sid)
-            for chunk in split_message(covers, 3900):
-                await q.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-            await q.message.reply_text("Готово ✅", reply_markup=script_tools_kb(get_script_by_id(sid, user.id)))
-        except Exception as e:
-            await q.edit_message_text(f"Ошибка ИИ: {e}", reply_markup=script_tools_kb(row))
-        return
-
-    if data.startswith("buy::"):
-        package_code = data.split("::", 1)[1]
-        try:
-            yk_id, url = await yk_create_payment(user.id, package_code)
-        except Exception as e:
-            await q.edit_message_text(f"Ошибка создания платежа: {e}", reply_markup=back_main_kb())
-            return
-
-        text = (
-            f"🧾 Заказ: *{PACKAGES[package_code]['title']}* на сумму *{PACKAGES[package_code]['price']}₽*.\n\n"
-            f"Перейдите по ссылке для оплаты:\n{url}\n\n"
-            f"После оплаты дождитесь уведомления или нажмите «Проверить оплату»."
-        )
-        await q.edit_message_text(text, reply_markup=buy_kb(), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "check_pay":
-        # проверим последний платеж в статусе pending (если захотят)
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM payments WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
-            (user.id,),
-        )
-        row = cur.fetchone()
-        conn.close()
-        if not row:
-            await q.edit_message_text("Нет неоплаченных платежей.", reply_markup=buy_kb())
-            return
-        try:
-            info = await yk_get_payment(row["yk_id"])
-            status = info["status"]
-            if status == "succeeded":
-                # начисляем, если по каким-то причинам вебхук не пришёл
-                update_payment_status(row["yk_id"], "succeeded")
-                update_user_balance(row["user_id"], row["package_count"])
-                await q.edit_message_text("Оплата найдена ✅ Сценарии начислены!", reply_markup=back_main_kb())
-            elif status == "canceled":
-                update_payment_status(row["yk_id"], "canceled")
-                await q.edit_message_text("Платёж отменён.", reply_markup=back_main_kb())
-            else:
-                await q.edit_message_text(f"Статус платежа: {status}. Подождите немного и повторите.", reply_markup=buy_kb())
-        except Exception as e:
-            await q.edit_message_text(f"Не удалось проверить: {e}", reply_markup=buy_kb())
-        return
-
-
-async def on_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатываем пользовательский ввод в шагах:
-    - ввод собственной темы
-    - ввод ниши/тона
-    - инструменты (хуки/обложки)
-    """
-    user = update.effective_user
-    text = (update.message.text or "").strip()
-    state = context.user_data.get("gen_state")
-    tool_mode = context.user_data.get("tool_mode")
-
-    # Если пользователь в режиме выбора темы, а отправил свой текст (= своя тема)
-    if state == "choose_theme":
-        theme = text
-        context.user_data["chosen_theme"] = theme
-        await update.message.reply_text(
-            f"Тема: *{theme}*\n\nНапиши нишу и тон через «;», например: `ниша; тон`.\nЕсли не нужно — отправь «-».",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=back_main_kb(),
-        )
-        context.user_data["gen_state"] = "await_niche_tone"
-        return
-
-    # Пользователь вводит нишу/тон
-    if state == "await_niche_tone":
-        niche, tone = None, None
-        if text != "-":
-            parts = [p.strip() for p in text.split(";")]
-            if len(parts) >= 1:
-                niche = parts[0] or None
-            if len(parts) >= 2:
-                tone = parts[1] or None
-        # Генерация
-        await process_generation(update, context, user.id, niche, tone)
-        context.user_data.clear()
-        return
-
-    # Старые инструменты через ввод ниши — теперь отключаем и ведём пользователя корректно
-    if tool_mode in ("hooks", "covers"):
-        context.user_data.clear()
-        await update.message.reply_text(
-            "Сначала сгенерируйте сценарий. После этого кнопки «⚡ Хуки…» и «🪄 Обложки…» станут активны бесплатно для этого сценария.",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    # Иначе просто покажем меню
-    await update.message.reply_text("Выбери действие:", reply_markup=main_menu_kb())
-
-
-async def process_generation(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    niche: Optional[str],
-    tone: Optional[str],
-):
-    # Проверка баланса / бесплатного
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT balance, last_free_at FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    now = datetime.now(timezone.utc)
-
-    def can_use_free() -> bool:
-        if not row["last_free_at"]:
-            return True
-        last = datetime.fromisoformat(row["last_free_at"]).astimezone(timezone.utc)
-        return (now - last) >= timedelta(hours=FREE_COOLDOWN_HOURS)
-
-    # Выбранная тема из user_data
-    theme = context.user_data.get("chosen_theme") or "Общая тема"
-
-    # Решаем чем платить
-    if row["balance"] > 0:
-        # списываем 1 сценарий
-        update_user_balance(user_id, -1)
-        paid_by = "баланс (-1)"
-    elif can_use_free():
-        set_user_last_free(user_id, now)
-        paid_by = "бесплатный за неделю"
-    else:
-        remain_hours =  (datetime.fromisoformat(row["last_free_at"]).astimezone(timezone.utc) + timedelta(hours=FREE_COOLDOWN_HOURS) - now)
-        hours = int(remain_hours.total_seconds() // 3600)
-        await update.message.reply_text(
-            f"Увы, бесплатный доступ будет через ~{hours} ч.\n"
-            f"Купите пакет сценариев в разделе «Купить сценарии».",
-            reply_markup=buy_kb(),
-        )
-        return
-
-    await update.message.reply_text(f"Готовлю сценарий ({paid_by})…")
-
-    try:
-        script = await generate_script(theme, niche, tone)
-        # Сохраним сценарий в БД и предложим хук/обложку
-        script_id = create_script_record(user_id, theme, niche, tone, script)
-        inc_total_generated(user_id)
-
-        # отправка сценария (с разбивкой)
-        for chunk in split_message(script, 3900):
-            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-
-        last = get_script_by_id(script_id, user_id)
-        await update.message.reply_text(
-            "Готово ✅\n\nБесплатно для этого сценария доступны:\n• ⚡ 1 хук\n• 🪄 1 обложка\nВыберите ниже:",
-            reply_markup=script_tools_kb(last),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception as e:
-        # если списали баланс и упали — вернём 1 сценарий
-        if paid_by.startswith("баланс"):
-            update_user_balance(user_id, +1)
-        await update.message.reply_text(f"Не удалось сгенерировать: {e}", reply_markup=main_menu_kb())
-
-
-def split_message(text: str, limit: int) -> list:
-    parts = []
-    buf = []
-    cur = 0
-    for line in text.splitlines(keepends=True):
-        if cur + len(line) > limit and buf:
-            parts.append("".join(buf))
-            buf = [line]
-            cur = len(line)
-        else:
-            buf.append(line)
-            cur += len(line)
-    if buf:
-        parts.append("".join(buf))
-    return parts
-
-
-# -------------------- APPLICATION SETUP --------------------
-
-def build_app() -> Application:
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .rate_limiter(AIORateLimiter())
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", start))
-
-    app.add_handler(CallbackQueryHandler(main_menu_cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_text))
-    app.add_handler(MessageHandler(filters.ALL, on_text))  # запасной
-
-    return app
-
-
-async def main():
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("No TELEGRAM_BOT_TOKEN provided")
-        return
-    if not OPENAI_API_KEY:
-        logger.warning("No OPENAI_API_KEY provided — генерация работать не будет")
-
-    logger.info("Starting bot...")
-    init_db()
-
-    # запускаем aiohttp вебсервер для вебхуков ЮKassa
-    runner = await run_web_server()
-
-    app = build_app()
-    # удалим вебхук TG (мы используем polling)
-    await app.bot.delete_webhook()
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    logger.info("Application started")
-
-    # держим процесс
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
+# ----------------
