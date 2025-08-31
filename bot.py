@@ -43,6 +43,9 @@ YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # твой публичный базовый URL сервиса
 PORT = int(os.getenv("PORT", "8080"))  # порт для aiohttp вебхуков ЮKassa
 
+# Админ-ид (через запятую) — удобная фича для отправки бюллетеней и т.д.
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+
 # Пакеты сценариев и цены, руб
 PACKAGES: Dict[str, Dict] = {
     "pack_7": {"title": "7 сценариев", "count": 7, "price": 260},
@@ -75,7 +78,6 @@ DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 
 # Модель OpenAI (можешь заменить, если есть доступ к другой)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 
 # -------------------- LOGGING --------------------
 
@@ -195,6 +197,11 @@ def get_or_create_user(user_id: int, username: Optional[str]) -> sqlite3.Row:
         conn.commit()
         cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = cur.fetchone()
+    else:
+        # Авто-обновление username если изменился
+        if username and row["username"] != username:
+            cur.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+            conn.commit()
     conn.close()
     return row
 
@@ -384,15 +391,28 @@ def count_referrals(referrer_id: int) -> Tuple[int, int]:
 # -------------------- UI HELPERS --------------------
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    # немного улучшенная клавиатура — группы и эмодзи
     rows = [
         [InlineKeyboardButton("🎬 Сгенерировать сценарий", callback_data="gen")],
-        [InlineKeyboardButton("🛒 Купить сценарии", callback_data="buy"),
-         InlineKeyboardButton("🧮 Баланс", callback_data="balance")],
-        [InlineKeyboardButton("ℹ️ О боте", callback_data="about")],
+        [
+            InlineKeyboardButton("🛒 Купить пакет", callback_data="buy"),
+            InlineKeyboardButton("🧮 Баланс", callback_data="balance"),
+        ],
+        [
+            InlineKeyboardButton("📣 Рефералы", callback_data="ref_info"),
+            InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+        ],
+        [
+            InlineKeyboardButton("ℹ️ О боте", callback_data="about"),
+            InlineKeyboardButton("❓ FAQ", callback_data="faq"),
+        ],
     ]
+    # доп инструменты (хуки/обложки) — будут добавлены как дополнительные строки
     extra = [InlineKeyboardButton(title, callback_data=cd) for title, cd in EXTRA_TOOLS]
-    for i in range(0, len(extra), 2):
-        rows.append(extra[i: i + 2])
+    # располагаем extra в отдельном ряду
+    if extra:
+        for i in range(0, len(extra), 2):
+            rows.append(extra[i: i + 2])
     return InlineKeyboardMarkup(rows)
 
 
@@ -438,20 +458,58 @@ WELCOME = (
     "Выбирай действие ниже 👇"
 )
 
-ABOUT = (
-    "🤖 *ReelsIdeas Pro*\n"
-    "— Полные сценарии с таймкодами, хуками и листом шотов\n"
-    "— Подпись, хештеги, CTA и идеи ремиксов/рефреймов\n"
-    "— Анализ трендов и форматов (UGC/стоки, jump-cut, ремиксы)\n\n"
-    "🎁 Для *каждого* сгенерированного сценария вы получаете *бесплатно*:\n"
-    "   • 1 хук (цепляющее начало) — один раз на сценарий\n"
-    "   • 1 идею обложки — один раз на сценарий\n"
-    "   (их можно запросить сразу после генерации сценария)\n\n"
-    "💳 Оплата через ЮKassa. После покупки сценарии начисляются на баланс.\n"
+ABOUT = textwrap.dedent(
+    """
+    🤖 *ReelsIdeas Pro — помощник по коротким видео*
+
+    Что делает:
+    • Генерирует полный производственный сценарий: название, хук, таймкоды, лист шотов, текст на экране, реплики, подписи и 20 хештегов.
+    • Для каждого сценария даёт *бесплатно* 1 хук и 1 идею обложки (однократно для сценария).
+    • Пакеты сценариев начисляются на баланс. Можно использовать баланс либо бесплатный сценарий 1 раз в 7 дней.
+
+    Почему это полезно:
+    • Экономит часы планирования — вы получаете готовый план съёмки.
+    • Подходит для Reels/Shorts/TikTok — учитываются современные форматы (jump-cut, UGC, ремиксы).
+    • Можно быстро генерировать массово (покупая пакеты) и получать разные варианты под ниши.
+
+    Как пользоваться:
+    1) Нажми *Сгенерировать сценарий* → выбери тему или введи свою → укажи «ниша; тон» или «-».
+    2) Используй кнопку *Купить пакет*, если нужно много сценариев.
+    3) После генерации доступны кнопки: ⚡ хук и 🪄 обложка (по одному разу на сценарий).
+
+    Реферальная программа:
+    • Пригласи друга — если он купит пакет, ты получаешь +1 сценарий.
+    • Команда /ref покажет твою реферальную ссылку и статистику.
+
+    Поддержка и автоматизация:
+    • FAQ доступен в меню (автоматические ответы).
+    • Административные команды (если ты админ) — рассылки и статы.
+
+    Удачи! Генерируй вирусные идеи и тестируй быстро.
+    """
+)
+
+FAQ_TEXT = textwrap.dedent(
+    """
+    ❓ *Частые вопросы — FAQ*
+
+    Q: Как часто можно получить бесплатный сценарий?
+    A: 1 раз в 7 дней.
+
+    Q: Что делать, если оплата прошла, но сценарии не начислены?
+    A: Проверь /menu → "Купить пакет" → "Проверить оплату", либо жди вебхук (обычно мгновенно). Если долго — пришли id платежа в админ-чат.
+
+    Q: Можно ли вернуть деньги?
+    A: При оплате действует политика платёжной системы — свяжитесь с поддержкой ЮKassa/банком. Бот не обрабатывает возвраты.
+
+    Q: Как работает реферальная программа?
+    A: Приглашённый должен открыть бота с вашей ссылкой (/start ref<id>) — если он купит пакет, вам начислят +1 сценарий.
+
+    Если не нашли ответ — напишите команду /help.
+    """
 )
 
 FREE_COOLDOWN_HOURS = 24 * 7  # 1 бесплатный раз в 7 дней
-
 
 # -------------------- OPENAI PROMPT --------------------
 
@@ -655,7 +713,7 @@ async def _reward_referrer_and_notify(payment_row: sqlite3.Row):
                 try:
                     await GLOBAL_APP.bot.send_message(
                         chat_id=referrer_id,
-                        text=f"🎉 Твой реферал @{referrer_id} совершил покупку — тебе начислен +1 сценарий!",
+                        text=f"🎉 Твой реферал совершил покупку — тебе начислен +1 сценарий!",
                     )
                 except Exception:
                     logger.exception("Failed to notify referrer %s", referrer_id)
@@ -783,12 +841,13 @@ async def show_referral_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
     link = f"https://t.me/{bot_username}?start=ref{user.id}" if bot_username else f"Оставь мой ник, чтобы получить ссылку"
     total, rewarded = count_referrals(user.id)
     text = (
-        f"📣 Твоя реферальная ссылка:\n{link}\n\n"
+        f"📣 *Твоя реферальная ссылка:*\n{link}\n\n"
         f"👥 Приглашено: {total}\n"
         f"🎁 Наград получено: {rewarded}\n\n"
-        f"За приглашённого, который купит - вы даёте +1 сценарий."
+        f"За приглашённого, который купит - ты получаешь +1 сценарий.\n\n"
+        f"Совет: поделись ссылкой в stories, профиль или в рассылке — люди чаще переходят именно оттуда."
     )
-    await update.effective_message.reply_text(text, reply_markup=main_menu_kb())
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 
 async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -833,6 +892,30 @@ async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "about":
         await q.edit_message_text(ABOUT, reply_markup=back_main_kb(), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "faq":
+        await q.edit_message_text(FAQ_TEXT, reply_markup=back_main_kb(), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "ref_info":
+        # делегируем к handler'у
+        await show_referral_info(update, context)
+        return
+
+    if data == "profile":
+        # профиль юзера
+        row = get_or_create_user(user.id, user.username)
+        total, rewarded = count_referrals(user.id)
+        text = (
+            f"👤 *Профиль*:\n"
+            f"ID: `{user.id}`\n"
+            f"Ник: @{user.username if user.username else '—'}\n"
+            f"Баланс сценариев: *{row['balance']}*\n"
+            f"Всего сгенерировано: *{row['total_generated']}*\n"
+            f"Приглашено: *{total}* (вознаграждено: *{rewarded}*)\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_main_kb())
         return
 
     if data == "back_main":
@@ -1099,6 +1182,7 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # если списали баланс и упали — вернём 1 сценарий
         if paid_by and paid_by.startswith("баланс"):
             update_user_balance(user_id, +1)
+        logger.exception("Generation failed")
         await update.message.reply_text(f"Не удалось сгенерировать: {e}", reply_markup=main_menu_kb())
 
 
@@ -1119,6 +1203,25 @@ def split_message(text: str, limit: int) -> list:
     return parts
 
 
+# -------------------- ADMIN / AUX HANDLERS --------------------
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "Команды:\n"
+        "/start — приветствие (поддерживает реферальный параметр /start ref<id>)\n"
+        "/menu — открыть меню\n"
+        "/ref — показать реферальную ссылку и статистику\n"
+        "/profile — показать профиль\n"
+        "/faq — часто задаваемые вопросы\n"
+        "/help — это сообщение\n"
+    )
+    await update.effective_message.reply_text(help_text)
+
+
+async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(FAQ_TEXT, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
+
+
 # -------------------- APPLICATION SETUP --------------------
 
 def build_app() -> Application:
@@ -1132,6 +1235,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("menu", start_cmd))
     app.add_handler(CommandHandler("ref", show_referral_info))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("faq", cmd_faq))
+    app.add_handler(CommandHandler("profile", lambda u, c: show_referral_info(u, c)))  # profile reuses info
 
     app.add_handler(CallbackQueryHandler(main_menu_cb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message_text))
